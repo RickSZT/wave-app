@@ -14,6 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
       - uses: actions/setup-java@v4
         with:
@@ -21,25 +22,78 @@ jobs:
           java-version: 17
 
       - name: Instalar dependências
-        run: npm install
+        run: npm ci
 
       - name: Adicionar plataforma Android
-        run: npx cap add android
+        run: |
+          rm -rf android
+          npx cap add android
 
       - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Adicionar permissões de segundo plano
+      - name: Corrigir segundo plano - permissões + serviço + WebView
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />|' $MANIFEST
+
+          # 1. Permissões (só adiciona se ainda não existir, não duplica)
+          grep -q "FOREGROUND_SERVICE\"" $MANIFEST || sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />|' $MANIFEST
+
+          # 2. ForegroundServiceType no <application> - OBRIGATÓRIO no Android 14+
+          # O BackgroundMode já cria seu próprio service, mas garantimos que o app pode usar
+          grep -q "foregroundServiceType" $MANIFEST || sed -i 's|<application|<application android:foregroundServiceType="mediaPlayback|dataSync"|' $MANIFEST
+
+          # 3. Não deixar o WebView pausar o áudio quando o app vai pro fundo
+          # O Capacitor pausa o WebView no onPause por padrão - isso mata o YouTube
+          MAIN=android/app/src/main/java/com/wave/app/MainActivity.java
+          cat > $MAIN << 'JAVA'
+          package com.wave.app;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              // Mantém o WebView vivo em segundo plano para o áudio não cortar
+              try {
+                if (bridge != null && bridge.getWebView() != null) {
+                  bridge.getWebView().getSettings().setMediaPlaybackRequiresUserGesture(false);
+                }
+              } catch (Exception e) {}
+            }
+
+            @Override
+            protected void onPause() {
+              // NÃO chama super.onPause() que pausaria o WebView / YouTube
+              // Só salva o estado, sem pausar o áudio
+              try {
+                if (bridge != null && bridge.getWebView() != null) {
+                  bridge.getWebView().onPause();
+                  // Desfaz o pause imediatamente - truque para manter o áudio
+                  bridge.getWebView().onResume();
+                }
+              } catch (Exception e) {}
+            }
+
+            @Override
+            protected void onResume() {
+              super.onResume();
+            }
+          }
+          JAVA
+
+          echo "--- AndroidManifest.xml ---"
           cat $MANIFEST
+          echo "--- MainActivity.java ---"
+          cat $MAIN
 
       - name: Build APK Debug
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --stacktrace
 
       - name: Enviar APK
         uses: actions/upload-artifact@v4
