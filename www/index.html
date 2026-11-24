@@ -116,9 +116,7 @@
 
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-// ===== TROQUE AQUI PELO SEU DOMÍNIO DO INFINITYFREE =====
 const API_URL = 'https://waves.gt.tc';
-// =========================================================
 
 let usuario = null;
 let modoCriar = false;
@@ -132,12 +130,42 @@ let ytPronto = false;
 let tocando = false;
 let timerProgresso = null;
 
+// ===== NORMALIZADOR - ACEITA QUALQUER FORMATO DO SERVIDOR =====
+// Seu servidor manda: {videoId, title, channel, thumb}
+// Outros mandam: {id, title, channelTitle, thumbnail}
+// Isso unifica tudo para {id, title, channel, thumb}
+function normalizar(m){
+  if(!m) return null;
+  if(typeof m === 'string') return {id:m, title:m, channel:'', thumb:''};
+  const id = m.id || m.videoId || m.video_id || m.videoID || '';
+  if(!id) return null;
+  const thumb = m.thumb || m.thumbnail || m.thumbUrl || m.image || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg');
+  return {
+    id: String(id),
+    title: m.title || m.titulo || m.name || 'Sem título',
+    channel: m.channel || m.channelTitle || m.canal || m.artist || '',
+    thumb: thumb
+  };
+}
+function normalizarLista(data){
+  if(!data) return [];
+  if(Array.isArray(data)) return data.map(normalizar).filter(Boolean);
+  if(Array.isArray(data.results)) return data.results.map(normalizar).filter(Boolean);
+  if(Array.isArray(data.playlist)) return data.playlist.map(normalizar).filter(Boolean);
+  if(Array.isArray(data.data)) return data.data.map(normalizar).filter(Boolean);
+  if(Array.isArray(data.items)) return data.items.map(normalizar).filter(Boolean);
+  if(data.videoId || data.id) { const um = normalizar(data); return um ? [um] : []; }
+  return [];
+}
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 // ===== SEGUNDO PLANO + TELA BLOQUEADA =====
 async function ativarSegundoPlano(){
   try{
     if(window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.BackgroundMode){
-      const { BackgroundMode } = window.Capacitor.Plugins;
-      await BackgroundMode.enable();
+      await window.Capacitor.Plugins.BackgroundMode.enable();
     }
   }catch(e){}
 }
@@ -159,13 +187,15 @@ function atualizarMediaSession(){
 
 // ===== LOGIN =====
 function verificarLogin(){
-  const salvo = localStorage.getItem('wave_user');
-  if(salvo){
-    usuario = JSON.parse(salvo);
-    document.getElementById('btn-login').classList.add('hidden');
-    document.getElementById('btn-sair').classList.remove('hidden');
-    carregarPlaylist();
-  }
+  try{
+    const salvo = localStorage.getItem('wave_user');
+    if(salvo){
+      usuario = JSON.parse(salvo);
+      document.getElementById('btn-login').classList.add('hidden');
+      document.getElementById('btn-sair').classList.remove('hidden');
+      carregarPlaylist();
+    }
+  }catch(e){}
 }
 function abrirLogin(){ document.getElementById('modal-login').classList.add('open'); }
 function fecharLogin(){ document.getElementById('modal-login').classList.remove('open'); }
@@ -175,6 +205,7 @@ function alternarModo(){
   document.getElementById('login-titulo').textContent = modoCriar ? 'Criar conta' : 'Entrar no Wave';
   document.getElementById('btn-entrar').textContent = modoCriar ? 'Criar conta' : 'Entrar';
   document.getElementById('link-criar').textContent = modoCriar ? 'Já tenho conta, entrar' : 'Não tenho conta, criar agora';
+  document.getElementById('login-erro').textContent = '';
 }
 async function fazerLogin(){
   const email = document.getElementById('login-email').value.trim();
@@ -183,25 +214,35 @@ async function fazerLogin(){
   const erroEl = document.getElementById('login-erro');
   if(!email || !senha){ erroEl.textContent='Preencha e-mail e senha'; return; }
   erroEl.textContent='Carregando...';
+  document.getElementById('btn-entrar').disabled = true;
   try{
     const action = modoCriar ? 'register' : 'login';
     const r = await fetch(API_URL + '/?action=' + action, {
       method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body: 'email='+encodeURIComponent(email)+'&senha='+encodeURIComponent(senha)+'&nome='+encodeURIComponent(nome)
+      body: 'email='+encodeURIComponent(email)+'&senha='+encodeURIComponent(senha)+'&nome='+encodeURIComponent(nome)+'&name='+encodeURIComponent(nome)
     });
-    const data = await r.json();
-    if(data.success || data.user){
-      usuario = data.user || {email, nome: nome || email};
+    const texto = await r.text();
+    let data = {};
+    try{ data = JSON.parse(texto); }catch(e){ data = {success:false, message:'Resposta inválida do servidor'}; }
+    if(data.success || data.user || data.ok){
+      usuario = data.user || {email, nome: nome || data.nome || email};
+      if(!usuario.email) usuario.email = email;
       localStorage.setItem('wave_user', JSON.stringify(usuario));
+      erroEl.textContent = '';
       fecharLogin();
       document.getElementById('btn-login').classList.add('hidden');
       document.getElementById('btn-sair').classList.remove('hidden');
       carregarPlaylist();
     } else {
-      erroEl.textContent = data.message || 'E-mail ou senha incorretos';
+      erroEl.textContent = data.message || data.error || 'E-mail ou senha incorretos';
     }
-  }catch(e){ erroEl.textContent='Erro de conexão com o servidor. Confira o API_URL.'; }
+  }catch(e){
+    erroEl.textContent='Erro de conexão com o servidor. Confira o CORS no index.php';
+    console.log('LOGIN ERRO:', e);
+  } finally {
+    document.getElementById('btn-entrar').disabled = false;
+  }
 }
 function sair(){
   usuario=null; localStorage.removeItem('wave_user');
@@ -216,11 +257,11 @@ async function buscar(){
   if(!q) return;
   mostrarAba('descobrir');
   document.getElementById('resultados').innerHTML='<div class="empty">Buscando...</div>';
+  document.getElementById('vazio-descobrir').style.display='none';
   try{
     const r = await fetch(API_URL + '/?q=' + encodeURIComponent(q));
     const data = await r.json();
-    const lista = data.results || data || [];
-    resultadosAtuais = lista;
+    resultadosAtuais = normalizarLista(data);
     renderResultados();
   }catch(e){
     document.getElementById('resultados').innerHTML='<div class="empty">Erro ao buscar. Confira se o API_URL está certo.</div>';
@@ -232,7 +273,8 @@ function renderResultados(){
   el.innerHTML='';
   resultadosAtuais.forEach((m,i)=>{
     const d=document.createElement('div'); d.className='card';
-    d.innerHTML=`<img src="${m.thumb}"><div class="card-info"><b>${m.title}</b><span>${m.channel}</span><button class="add" onclick="event.stopPropagation(); salvarNaPlaylist('${m.id}')">+ Playlist</button></div>`;
+    d.innerHTML=`<img src="${esc(m.thumb)}" loading="lazy"><div class="card-info"><b>${esc(m.title)}</b><span>${esc(m.channel)}</span><button class="add" data-idx="${i}">+ Playlist</button></div>`;
+    d.querySelector('.add').onclick = (e)=>{ e.stopPropagation(); salvarNaPlaylist(m.id); };
     d.onclick=()=> tocarMusica(m, resultadosAtuais, i);
     el.appendChild(d);
   });
@@ -244,7 +286,7 @@ async function carregarPlaylist(){
   try{
     const r = await fetch(API_URL + '/?action=get_playlist&email=' + encodeURIComponent(usuario.email));
     const data = await r.json();
-    playlistAtual = data.playlist || data || [];
+    playlistAtual = normalizarLista(data);
     renderPlaylist();
   }catch(e){}
 }
@@ -254,7 +296,8 @@ function renderPlaylist(){
   el.innerHTML='';
   playlistAtual.forEach((m,i)=>{
     const d=document.createElement('div'); d.className='row';
-    d.innerHTML=`<img src="${m.thumb}"><div><b>${m.title}</b><span>${m.channel}</span></div><button class="del" onclick="event.stopPropagation(); removerDaPlaylist('${m.id}')">X</button>`;
+    d.innerHTML=`<img src="${esc(m.thumb)}" loading="lazy"><div><b>${esc(m.title)}</b><span>${esc(m.channel)}</span></div><button class="del">X</button>`;
+    d.querySelector('.del').onclick = (e)=>{ e.stopPropagation(); removerDaPlaylist(m.id); };
     d.onclick=()=> tocarMusica(m, playlistAtual, i);
     el.appendChild(d);
   });
@@ -267,9 +310,9 @@ async function salvarNaPlaylist(id){
     await fetch(API_URL + '/?action=add_playlist', {
       method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'email='+encodeURIComponent(usuario.email)+'&id='+encodeURIComponent(m.id)+'&title='+encodeURIComponent(m.title)+'&channel='+encodeURIComponent(m.channel)+'&thumb='+encodeURIComponent(m.thumb)
+      body:'email='+encodeURIComponent(usuario.email)+'&id='+encodeURIComponent(m.id)+'&videoId='+encodeURIComponent(m.id)+'&title='+encodeURIComponent(m.title)+'&channel='+encodeURIComponent(m.channel)+'&thumb='+encodeURIComponent(m.thumb)
     });
-    carregarPlaylist();
+    await carregarPlaylist();
     alert('Salvo na playlist!');
   }catch(e){ alert('Erro ao salvar'); }
 }
@@ -279,9 +322,9 @@ async function removerDaPlaylist(id){
     await fetch(API_URL + '/?action=remove_playlist', {
       method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'email='+encodeURIComponent(usuario.email)+'&id='+encodeURIComponent(id)
+      body:'email='+encodeURIComponent(usuario.email)+'&id='+encodeURIComponent(id)+'&videoId='+encodeURIComponent(id)
     });
-    carregarPlaylist();
+    await carregarPlaylist();
   }catch(e){}
 }
 
@@ -290,16 +333,19 @@ function onYouTubeIframeAPIReady(){
   ytPronto=true;
   ytPlayer = new YT.Player('yt-player', {
     height:'1', width:'1',
-    playerVars:{ autoplay:0, controls:0, disablekb:1 },
-    events:{ onStateChange: onPlayerState }
+    playerVars:{ autoplay:0, controls:0, disablekb:1, playsinline:1 },
+    events:{ onStateChange: onPlayerState, onError: onPlayerError }
   });
 }
+function onPlayerError(e){ console.log('YT Error', e.data); }
 function onPlayerState(e){
   if(e.data===YT.PlayerState.ENDED) proxima();
   if(e.data===YT.PlayerState.PLAYING){ tocando=true; document.getElementById('btn-play').textContent='⏸'; iniciarProgresso(); }
   if(e.data===YT.PlayerState.PAUSED){ tocando=false; document.getElementById('btn-play').textContent='▶'; }
 }
 function tocarMusica(m, lista, idx){
+  m = normalizar(m);
+  if(!m) return;
   musicaAtual=m; filaAtual=lista; indiceAtual=idx;
   document.getElementById('player').classList.remove('hidden');
   document.getElementById('p-thumb').src=m.thumb;
@@ -310,8 +356,7 @@ function tocarMusica(m, lista, idx){
   if(ytPronto && ytPlayer && ytPlayer.loadVideoById){
     ytPlayer.loadVideoById(m.id);
   } else {
-    // Se API ainda não carregou, tenta de novo em 500ms
-    setTimeout(()=>{ if(ytPlayer) ytPlayer.loadVideoById(m.id); }, 500);
+    setTimeout(()=>{ if(ytPlayer && ytPlayer.loadVideoById) ytPlayer.loadVideoById(m.id); }, 500);
   }
 }
 function togglePlay(){
@@ -331,7 +376,7 @@ function anterior(){
 function seek(v){
   if(!ytPlayer || !ytPlayer.getDuration) return;
   const dur = ytPlayer.getDuration();
-  ytPlayer.seekTo(dur * v / 100, true);
+  if(dur) ytPlayer.seekTo(dur * v / 100, true);
 }
 function iniciarProgresso(){
   clearInterval(timerProgresso);
