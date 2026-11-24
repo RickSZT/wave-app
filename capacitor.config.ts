@@ -1,16 +1,18 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.elioenai.wave',
+  appId: 'com.wave.app',
   appName: 'Wave',
   webDir: 'www',
   server: {
-    androidScheme: 'https',
-    allowNavigation: ['*.infinityfreeapp.com', 'www.youtube.com', 'youtube.com']
+    url: 'https://waves.gt.tc',
+    cleartext: false
   },
   plugins: {
     BackgroundMode: {
-      enabled: true
+      title: 'Wave tocando',
+      text: 'Sua música continua tocando',
+      icon: 'ic_launcher'
     }
   }
 };
