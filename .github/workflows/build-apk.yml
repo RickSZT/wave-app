@@ -29,7 +29,6 @@ jobs:
         run: |
           python3 << 'PY'
           import pathlib
-          # 1. Manifest - permissões + serviço
           p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           txt = p.read_text()
           for perm in ["FOREGROUND_SERVICE","FOREGROUND_SERVICE_MEDIA_PLAYBACK","FOREGROUND_SERVICE_DATA_SYNC","POST_NOTIFICATIONS","WAKE_LOCK","RECEIVE_BOOT_COMPLETED"]:
@@ -41,7 +40,6 @@ jobs:
           if "WaveService" not in txt:
               txt = txt.replace("</application>", '        <service android:name=".WaveService" android:exported="false" android:foregroundServiceType="mediaPlayback|dataSync" />\n    </application>', 1)
           p.write_text(txt)
-          # 2. Gradle - ExoPlayer
           g = pathlib.Path("android/app/build.gradle")
           gt = g.read_text()
           if "exoplayer" not in gt.lower():
@@ -50,7 +48,6 @@ jobs:
           print("OK")
           PY
 
-          # 3. Serviço que TOCA DE VERDADE - fora do WebView
           cat > android/app/src/main/java/com/wave/app/WaveService.java << 'JAVA'
           package com.wave.app;
 
@@ -130,26 +127,29 @@ jobs:
             private void fetchAndPlay(String vid) {
               new Thread(() -> {
                 String audioUrl = null;
-                // Tenta Piped - retorna audioStreams sem precisar de API key
                 String[] endpoints = {
                   "https://pipedapi.kavin.rocks/streams/" + vid,
+                  "https://pipedapi-libre.kavin.rocks/streams/" + vid,
                   "https://pipedapi.adminforge.de/streams/" + vid,
-                  "https://pipedapi.leptons.xyz/streams/" + vid
+                  "https://pipedapi.leptons.xyz/streams/" + vid,
+                  "https://pipedapi.reallyaweso.me/streams/" + vid,
+                  "https://pipedapi.drgns.space/streams/" + vid
                 };
                 for (String ep : endpoints) {
                   try {
                     HttpURLConnection c = (HttpURLConnection) new URL(ep).openConnection();
                     c.setConnectTimeout(8000); c.setReadTimeout(8000);
+                    c.setRequestProperty("User-Agent", "Mozilla/5.0");
                     BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()));
                     StringBuilder sb = new StringBuilder(); String line;
                     while ((line = r.readLine()) != null) sb.append(line);
                     JSONObject j = new JSONObject(sb.toString());
                     JSONArray arr = j.getJSONArray("audioStreams");
-                    // Pega o melhor áudio - opus ou m4a
                     for (int k = 0; k < arr.length(); k++) {
                       JSONObject a = arr.getJSONObject(k);
-                      if (a.has("url")) { audioUrl = a.getString("url"); break; }
+                      if (a.has("url") && a.optString("mimeType","").contains("audio")) { audioUrl = a.getString("url"); break; }
                     }
+                    if (audioUrl == null && arr.length() > 0) audioUrl = arr.getJSONObject(0).getString("url");
                     if (audioUrl != null) break;
                   } catch (Exception e) {}
                 }
@@ -179,7 +179,6 @@ jobs:
           }
           JAVA
 
-          # 4. MainActivity - expõe WaveAudio pro JS e NÃO pausa o WebView no onStop
           cat > android/app/src/main/java/com/wave/app/MainActivity.java << 'JAVA'
           package com.wave.app;
 
