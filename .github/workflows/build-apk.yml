@@ -38,7 +38,6 @@ jobs:
           p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           txt = p.read_text()
 
-          # 1. Permissões - só adiciona se ainda não existir
           perms = [
               "FOREGROUND_SERVICE",
               "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
@@ -56,7 +55,6 @@ jobs:
                       1
                   )
 
-          # 2. foregroundServiceType - sem usar sed, sem quebrar com o |
           if "foregroundServiceType" not in txt:
               txt = txt.replace(
                   "<application",
@@ -87,7 +85,7 @@ jobs:
             }
 
             @Override
-            protected void onPause() {
+            public void onPause() {
               try {
                 if (bridge != null && bridge.getWebView() != null) {
                   bridge.getWebView().onPause();
@@ -97,7 +95,7 @@ jobs:
             }
 
             @Override
-            protected void onResume() {
+            public void onResume() {
               super.onResume();
             }
           }
