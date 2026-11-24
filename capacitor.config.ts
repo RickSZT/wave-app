@@ -15,14 +15,6 @@ const config: CapacitorConfig = {
     allowMixedContent: true
   },
   plugins: {
-    BackgroundMode: {
-      title: 'Wave tocando',
-      text: 'Sua música continua tocando',
-      icon: 'ic_launcher',
-      color: '4fd8ff',
-      resume: true,
-      silent: false
-    },
     SplashScreen: {
       launchShowDuration: 0
     },
