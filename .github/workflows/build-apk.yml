@@ -26,6 +26,12 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
+      - name: Adicionar permissões de segundo plano
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />|' $MANIFEST
+          cat $MANIFEST
+
       - name: Build APK Debug
         run: |
           cd android
