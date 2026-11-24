@@ -31,13 +31,12 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Corrigir segundo plano - permissões + serviço + WebView
+      - name: Corrigir segundo plano - Foreground Service + WebView
         run: |
           python3 << 'PY'
           import pathlib
           p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           txt = p.read_text()
-
           perms = [
               "FOREGROUND_SERVICE",
               "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
@@ -54,26 +53,97 @@ jobs:
                       '<uses-permission android:name="android.permission.INTERNET" />\n    ' + tag,
                       1
                   )
-
           if "foregroundServiceType" not in txt:
+              txt = txt.replace("<application", '<application android:foregroundServiceType="mediaPlayback|dataSync"', 1)
+          if "WaveService" not in txt:
               txt = txt.replace(
-                  "<application",
-                  '<application android:foregroundServiceType="mediaPlayback|dataSync"',
+                  "</application>",
+                  '        <service android:name=".WaveService" android:exported="false" android:foregroundServiceType="mediaPlayback|dataSync" />\n    </application>',
                   1
               )
-
           p.write_text(txt)
           print(txt)
           PY
 
-          MAIN=android/app/src/main/java/com/wave/app/MainActivity.java
-          cat > $MAIN << 'JAVA'
+          cat > android/app/src/main/java/com/wave/app/WaveService.java << 'JAVA'
           package com.wave.app;
 
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+
+          public class WaveService extends Service {
+            private PowerManager.WakeLock wakeLock;
+            public static final String CHANNEL = "wave_playback";
+
+            @Override
+            public void onCreate() {
+              super.onCreate();
+              PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+              wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Wave::PlaybackLock");
+              wakeLock.setReferenceCounted(false);
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              createChannel();
+              Intent ni = new Intent(this, MainActivity.class);
+              PendingIntent pi = PendingIntent.getActivity(this, 0, ni, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+              Notification.Builder b;
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                b = new Notification.Builder(this, CHANNEL);
+              } else {
+                b = new Notification.Builder(this);
+              }
+              Notification n = b
+                .setContentTitle("Wave tocando")
+                .setContentText("Sua música continua tocando")
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .build();
+              startForeground(1, n);
+              if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(10*60*1000L);
+              return START_STICKY;
+            }
+
+            private void createChannel() {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel ch = new NotificationChannel(CHANNEL, "Wave Playback", NotificationManager.IMPORTANCE_LOW);
+                ch.setDescription("Mantém a música tocando em segundo plano");
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                if (nm != null) nm.createNotificationChannel(ch);
+              }
+            }
+
+            @Override
+            public void onDestroy() {
+              if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+          }
+          JAVA
+
+          cat > android/app/src/main/java/com/wave/app/MainActivity.java << 'JAVA'
+          package com.wave.app;
+
+          import android.content.Intent;
+          import android.os.Build;
           import android.os.Bundle;
           import com.getcapacitor.BridgeActivity;
 
           public class MainActivity extends BridgeActivity {
+            private boolean serviceStarted = false;
+
             @Override
             protected void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
@@ -84,11 +154,33 @@ jobs:
               } catch (Exception e) {}
             }
 
+            private void startWaveService() {
+              if (serviceStarted) return;
+              try {
+                Intent i = new Intent(this, WaveService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                  startForegroundService(i);
+                } else {
+                  startService(i);
+                }
+                serviceStarted = true;
+              } catch (Exception e) {}
+            }
+
+            private void stopWaveService() {
+              if (!serviceStarted) return;
+              try {
+                stopService(new Intent(this, WaveService.class));
+                serviceStarted = false;
+              } catch (Exception e) {}
+            }
+
             @Override
             public void onPause() {
+              super.onPause();
+              startWaveService();
               try {
                 if (bridge != null && bridge.getWebView() != null) {
-                  bridge.getWebView().onPause();
                   bridge.getWebView().onResume();
                 }
               } catch (Exception e) {}
@@ -97,6 +189,23 @@ jobs:
             @Override
             public void onResume() {
               super.onResume();
+            }
+
+            @Override
+            public void onStop() {
+              super.onStop();
+              startWaveService();
+              try {
+                if (bridge != null && bridge.getWebView() != null) {
+                  bridge.getWebView().onResume();
+                }
+              } catch (Exception e) {}
+            }
+
+            @Override
+            public void onDestroy() {
+              stopWaveService();
+              super.onDestroy();
             }
           }
           JAVA
