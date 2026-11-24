@@ -31,18 +31,17 @@ jobs:
           import pathlib
           p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
           txt = p.read_text()
-          for perm in ["FOREGROUND_SERVICE","FOREGROUND_SERVICE_MEDIA_PLAYBACK","FOREGROUND_SERVICE_DATA_SYNC","POST_NOTIFICATIONS","WAKE_LOCK","RECEIVE_BOOT_COMPLETED"]:
-              tag = f'<uses-permission android:name="android.permission.{perm}" />'
-              if perm not in txt:
-                  txt = txt.replace('<uses-permission android:name="android.permission.INTERNET" />', '<uses-permission android:name="android.permission.INTERNET" />\n    ' + tag, 1)
-          if "foregroundServiceType" not in txt:
-              txt = txt.replace("<application", '<application android:foregroundServiceType="mediaPlayback|dataSync"', 1)
+          anchor = '<uses-permission android:name="android.permission.INTERNET" />'
+          assert anchor in txt, "ancora INTERNET nao encontrada"
+          for perm in ["FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "POST_NOTIFICATIONS", "WAKE_LOCK"]:
+              if f'android.permission.{perm}"' not in txt:
+                  txt = txt.replace(anchor, anchor + '\n    <uses-permission android:name="android.permission.' + perm + '" />', 1)
           if "WaveService" not in txt:
-              txt = txt.replace("</application>", '        <service android:name=".WaveService" android:exported="false" android:foregroundServiceType="mediaPlayback|dataSync" />\n    </application>', 1)
+              txt = txt.replace("</application>", '    <service android:name=".WaveService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    </application>', 1)
           p.write_text(txt)
           g = pathlib.Path("android/app/build.gradle")
           gt = g.read_text()
-          if "exoplayer" not in gt.lower():
+          if "media3-exoplayer" not in gt:
               gt = gt.replace("dependencies {", "dependencies {\n    implementation 'androidx.media3:media3-exoplayer:1.3.1'\n    implementation 'androidx.media3:media3-session:1.3.1'", 1)
               g.write_text(gt)
           print("OK")
@@ -58,9 +57,15 @@ jobs:
           import android.app.Service;
           import android.content.Intent;
           import android.os.Build;
+          import android.os.Handler;
           import android.os.IBinder;
+          import android.os.Looper;
           import android.os.PowerManager;
+          import androidx.media3.common.AudioAttributes;
+          import androidx.media3.common.C;
           import androidx.media3.common.MediaItem;
+          import androidx.media3.common.PlaybackException;
+          import androidx.media3.common.Player;
           import androidx.media3.exoplayer.ExoPlayer;
           import org.json.JSONArray;
           import org.json.JSONObject;
@@ -68,14 +73,49 @@ jobs:
           import java.io.InputStreamReader;
           import java.net.HttpURLConnection;
           import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.List;
 
           public class WaveService extends Service {
+            // O ExoPlayer SO pode ser acessado na thread principal.
+            // A ponte JS roda em outra thread, entao ela le apenas estes campos em cache.
             public static ExoPlayer player;
+            public static volatile long posMs = 0;
+            public static volatile long durMs = 0;
+            public static volatile boolean playing = false;
+            public static volatile String error = "";
+            public static volatile int gen = 0;
             public static String currentId = "";
             public static String currentTitle = "";
             public static String currentChannel = "";
-            private PowerManager.WakeLock wakeLock;
             public static final String CHANNEL = "wave_playback";
+
+            private static final Handler MAIN = new Handler(Looper.getMainLooper());
+            private PowerManager.WakeLock wakeLock;
+
+            private static final String[] FALLBACK = {
+              "https://pipedapi.kavin.rocks",
+              "https://pipedapi-libre.kavin.rocks",
+              "https://pipedapi.adminforge.de",
+              "https://pipedapi.leptons.xyz",
+              "https://pipedapi.reallyaweso.me",
+              "https://pipedapi.drgns.space"
+            };
+
+            private final Runnable ticker = new Runnable() {
+              @Override public void run() {
+                ExoPlayer p = player;
+                if (p != null) {
+                  posMs = p.getCurrentPosition();
+                  long d = p.getDuration();
+                  durMs = (d == C.TIME_UNSET || d < 0) ? 0 : d;
+                  playing = p.isPlaying();
+                }
+                MAIN.postDelayed(this, 500);
+              }
+            };
+
+            public static void onMain(Runnable r) { MAIN.post(r); }
 
             @Override public void onCreate() {
               super.onCreate();
@@ -84,8 +124,20 @@ jobs:
               wakeLock.setReferenceCounted(false);
               if (player == null) {
                 player = new ExoPlayer.Builder(this).build();
-                player.setWakeMode(androidx.media3.common.C.WAKE_MODE_NETWORK);
+                player.setWakeMode(C.WAKE_MODE_NETWORK);
+                player.setAudioAttributes(new AudioAttributes.Builder()
+                  .setUsage(C.USAGE_MEDIA)
+                  .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                  .build(), true);
+                player.setHandleAudioBecomingNoisy(true);
+                player.addListener(new Player.Listener() {
+                  @Override public void onPlayerError(PlaybackException e) {
+                    error = "player:" + e.getErrorCodeName();
+                  }
+                });
               }
+              MAIN.removeCallbacks(ticker);
+              MAIN.post(ticker);
             }
 
             public static void playId(android.content.Context ctx, String videoId, String title, String channel) {
@@ -103,8 +155,11 @@ jobs:
                 currentId = vid;
                 currentTitle = intent.getStringExtra("title");
                 currentChannel = intent.getStringExtra("channel");
+                gen++;
+                posMs = 0; durMs = 0; playing = false; error = "";
                 startForegroundWith(currentTitle);
-                fetchAndPlay(vid);
+                if (vid != null && !vid.isEmpty()) fetchAndPlay(vid, gen);
+                else error = "no_video_id";
               } else {
                 startForegroundWith(currentTitle);
               }
@@ -112,55 +167,86 @@ jobs:
             }
 
             private void startForegroundWith(String title) {
-              createChannel();
-              Intent ni = new Intent(this, MainActivity.class);
-              PendingIntent pi = PendingIntent.getActivity(this, 0, ni, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-              Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
-              Notification n = b.setContentTitle(title == null || title.isEmpty() ? "Wave tocando" : title)
-                .setContentText(currentChannel == null ? "Wave" : currentChannel)
-                .setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentIntent(pi).setOngoing(true).build();
-              startForeground(1, n);
-              if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(10*60*60*1000L);
+              try {
+                createChannel();
+                Intent ni = new Intent(this, MainActivity.class);
+                PendingIntent pi = PendingIntent.getActivity(this, 0, ni, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+                Notification n = b.setContentTitle(title == null || title.isEmpty() ? "Wave tocando" : title)
+                  .setContentText(currentChannel == null ? "Wave" : currentChannel)
+                  .setSmallIcon(android.R.drawable.ic_media_play)
+                  .setContentIntent(pi).setOngoing(true).build();
+                startForeground(1, n);
+              } catch (Exception e) {
+                // nao derruba o app se o sistema recusar o foreground; o audio ainda pode tocar
+              }
+              if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(10 * 60 * 60 * 1000L);
             }
 
-            private void fetchAndPlay(String vid) {
+            private static String httpGet(String u, int timeoutMs) throws Exception {
+              HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+              c.setConnectTimeout(timeoutMs);
+              c.setReadTimeout(timeoutMs);
+              c.setRequestProperty("User-Agent", "Mozilla/5.0");
+              if (c.getResponseCode() != 200) throw new Exception("HTTP " + c.getResponseCode());
+              BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()));
+              StringBuilder sb = new StringBuilder();
+              String line;
+              while ((line = r.readLine()) != null) sb.append(line);
+              r.close();
+              return sb.toString();
+            }
+
+            private static String pickAudio(JSONArray arr) {
+              String best = null, any = null;
+              int bestBr = -1;
+              for (int k = 0; k < arr.length(); k++) {
+                JSONObject a = arr.optJSONObject(k);
+                if (a == null) continue;
+                String url = a.optString("url", "");
+                if (url.isEmpty()) continue;
+                if (any == null) any = url;
+                if (a.optString("mimeType", "").contains("mp4")) {
+                  int br = a.optInt("bitrate", 0);
+                  if (br > bestBr) { bestBr = br; best = url; }
+                }
+              }
+              return best != null ? best : any;
+            }
+
+            private void fetchAndPlay(final String vid, final int myGen) {
               new Thread(() -> {
+                List<String> bases = new ArrayList<>();
+                // lista dinamica de instancias Piped que estao no ar
+                try {
+                  JSONArray list = new JSONArray(httpGet("https://piped-instances.kavin.rocks/", 5000));
+                  for (int i = 0; i < list.length() && bases.size() < 8; i++) {
+                    String a = list.getJSONObject(i).optString("api_url", "");
+                    if (a.endsWith("/")) a = a.substring(0, a.length() - 1);
+                    if (!a.isEmpty() && !bases.contains(a)) bases.add(a);
+                  }
+                } catch (Exception e) {}
+                for (String f : FALLBACK) if (!bases.contains(f)) bases.add(f);
+
                 String audioUrl = null;
-                String[] endpoints = {
-                  "https://pipedapi.kavin.rocks/streams/" + vid,
-                  "https://pipedapi-libre.kavin.rocks/streams/" + vid,
-                  "https://pipedapi.adminforge.de/streams/" + vid,
-                  "https://pipedapi.leptons.xyz/streams/" + vid,
-                  "https://pipedapi.reallyaweso.me/streams/" + vid,
-                  "https://pipedapi.drgns.space/streams/" + vid
-                };
-                for (String ep : endpoints) {
+                for (String base : bases) {
+                  if (myGen != gen) return; // usuario ja trocou de musica
                   try {
-                    HttpURLConnection c = (HttpURLConnection) new URL(ep).openConnection();
-                    c.setConnectTimeout(8000); c.setReadTimeout(8000);
-                    c.setRequestProperty("User-Agent", "Mozilla/5.0");
-                    BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()));
-                    StringBuilder sb = new StringBuilder(); String line;
-                    while ((line = r.readLine()) != null) sb.append(line);
-                    JSONObject j = new JSONObject(sb.toString());
-                    JSONArray arr = j.getJSONArray("audioStreams");
-                    for (int k = 0; k < arr.length(); k++) {
-                      JSONObject a = arr.getJSONObject(k);
-                      if (a.has("url") && a.optString("mimeType","").contains("audio")) { audioUrl = a.getString("url"); break; }
-                    }
-                    if (audioUrl == null && arr.length() > 0) audioUrl = arr.getJSONObject(0).getString("url");
+                    JSONObject j = new JSONObject(httpGet(base + "/streams/" + vid, 7000));
+                    if (j.has("error")) continue;
+                    audioUrl = pickAudio(j.getJSONArray("audioStreams"));
                     if (audioUrl != null) break;
                   } catch (Exception e) {}
                 }
-                if (audioUrl != null && player != null) {
-                  String url = audioUrl;
-                  new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                    player.setMediaItem(MediaItem.fromUri(url));
-                    player.prepare();
-                    player.play();
-                  });
-                }
+                if (myGen != gen) return;
+                if (audioUrl == null) { error = "resolve_failed"; return; }
+                final String u = audioUrl;
+                MAIN.post(() -> {
+                  if (myGen != gen || player == null) return;
+                  player.setMediaItem(MediaItem.fromUri(u));
+                  player.prepare();
+                  player.play();
+                });
               }).start();
             }
 
@@ -171,10 +257,13 @@ jobs:
                 if (nm != null) nm.createNotificationChannel(ch);
               }
             }
+
             @Override public void onDestroy() {
+              MAIN.removeCallbacks(ticker);
               if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
               super.onDestroy();
             }
+
             @Override public IBinder onBind(Intent intent) { return null; }
           }
           JAVA
@@ -182,8 +271,11 @@ jobs:
           cat > android/app/src/main/java/com/wave/app/MainActivity.java << 'JAVA'
           package com.wave.app;
 
+          import android.content.pm.PackageManager;
+          import android.os.Build;
           import android.os.Bundle;
           import android.webkit.JavascriptInterface;
+          import androidx.media3.exoplayer.ExoPlayer;
           import com.getcapacitor.BridgeActivity;
 
           public class MainActivity extends BridgeActivity {
@@ -196,26 +288,44 @@ jobs:
                   bridge.getWebView().addJavascriptInterface(new WaveAudio(), "WaveAudio");
                 }
               } catch (Exception e) {}
+              try {
+                if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                  requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
+                }
+              } catch (Exception e) {}
             }
+
+            // Estes metodos rodam na thread da ponte JS (nao na principal).
+            // Comandos vao para a thread principal; leituras usam o cache do servico.
             public class WaveAudio {
               @JavascriptInterface public void play(String videoId, String title, String channel) {
                 WaveService.playId(MainActivity.this, videoId, title, channel);
               }
-              @JavascriptInterface public void pause() { if (WaveService.player != null) WaveService.player.pause(); }
-              @JavascriptInterface public void resume() { if (WaveService.player != null) WaveService.player.play(); }
-              @JavascriptInterface public void toggle() {
-                if (WaveService.player == null) return;
-                if (WaveService.player.isPlaying()) WaveService.player.pause(); else WaveService.player.play();
+              @JavascriptInterface public void pause() {
+                WaveService.onMain(() -> { ExoPlayer p = WaveService.player; if (p != null) p.pause(); });
               }
-              @JavascriptInterface public void seekTo(long ms) { if (WaveService.player != null) WaveService.player.seekTo(ms); }
-              @JavascriptInterface public long getPosition() { return WaveService.player != null ? WaveService.player.getCurrentPosition() : 0; }
-              @JavascriptInterface public long getDuration() { return WaveService.player != null && WaveService.player.getDuration() > 0 ? WaveService.player.getDuration() : 0; }
-              @JavascriptInterface public boolean isPlaying() { return WaveService.player != null && WaveService.player.isPlaying(); }
-              @JavascriptInterface public void setVolume(float v) { if (WaveService.player != null) WaveService.player.setVolume(v); }
+              @JavascriptInterface public void resume() {
+                WaveService.onMain(() -> { ExoPlayer p = WaveService.player; if (p != null) p.play(); });
+              }
+              @JavascriptInterface public void toggle() {
+                WaveService.onMain(() -> {
+                  ExoPlayer p = WaveService.player;
+                  if (p == null) return;
+                  if (p.isPlaying()) p.pause(); else p.play();
+                });
+              }
+              @JavascriptInterface public void seekTo(long ms) {
+                WaveService.onMain(() -> { ExoPlayer p = WaveService.player; if (p != null) p.seekTo(ms); });
+              }
+              @JavascriptInterface public void setVolume(float v) {
+                WaveService.onMain(() -> { ExoPlayer p = WaveService.player; if (p != null) p.setVolume(v); });
+              }
+              @JavascriptInterface public long getPosition() { return WaveService.posMs; }
+              @JavascriptInterface public long getDuration() { return WaveService.durMs; }
+              @JavascriptInterface public boolean isPlaying() { return WaveService.playing; }
+              @JavascriptInterface public String getError() { return WaveService.error; }
             }
-            @Override public void onPause() { super.onPause(); }
-            @Override public void onResume() { super.onResume(); }
-            @Override public void onStop() { super.onStop(); }
           }
           JAVA
 
